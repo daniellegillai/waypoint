@@ -109,6 +109,7 @@ func main() {
 		fmt.Println("  fork <session> <checkpoint-id> [--id ID] [--n K] - Materialize live fork(s)")
 		fmt.Println("  exec <session> <fork-id> -- '<command>'      - Run one bash command line in a fork")
 		fmt.Println("  cp <session> <source> <destination>          - Copy host path <-> fork-id:/path")
+		fmt.Println("  blame <session> <checkpoint-id> <path> 		- Blame a path from a checkpoint through its ancestors")
 		fmt.Println("  snapshot <session> <fork-id> <checkpoint-id> [--park] - Snapshot a live fork (--park: don't resume it)")
 		fmt.Println("  create <session> <checkpoint-id>             - Legacy alias for checkpoint")
 		fmt.Println("  fork-exec <session> <fork-id> <command>      - Legacy alias for exec")
@@ -560,6 +561,24 @@ func main() {
 	case "cp":
 		if err := runCopy(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error copying: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "blame":
+		if len(os.Args) < 5 {
+			fmt.Println("Usage: blame <session> <checkpoint-id> <path>")
+			os.Exit(1)
+		}
+		sessionID := os.Args[2]
+		ckptID := os.Args[3]
+		path := os.Args[4]
+		manager, err := waypoint.LoadManager(sessionID)
+		if err != nil {
+			fmt.Printf("Error loading session: %v\n", err)
+			os.Exit(1)
+		}
+		if err := manager.PrintBlame(ckptId, path); err != nil {
+			fmt.Printf("Error on blame: %v\n", err)
 			os.Exit(1)
 		}
 
