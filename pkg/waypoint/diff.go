@@ -155,23 +155,21 @@ func getFileType(root *os.Root, path string) (FileType, error) {
 }
 
 func isWithinAnyPrefix(path string, prefixes map[string]struct{}) bool {
-    for current := path; ; current = filepath.Dir(current) {
-        if _, exists := prefixes[current]; exists {
-            return true
-        }
-        parent := filepath.Dir(current)
-        if parent == current {
-            break
-        }
-    }
-    return false
+	for current := path; ; current = filepath.Dir(current) {
+		if _, exists := prefixes[current]; exists {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return false
 }
 
 func processNonDirMod(leftRoot, rightRoot *os.Root, rootViewPath, containerViewPath string, prefixes, files map[string]struct{}, detected *[]DiffFileRecord) error {
-	if _, exists := files[containerViewPath]; !exists {
-		return nil
-	}
-	if !isWithinAnyPrefix(containerViewPath, prefixes) {
+	_, exists := files[containerViewPath]
+	if !exists && !isWithinAnyPrefix(containerViewPath, prefixes) {
 		return nil
 	}
 	leftInfo, err := leftRoot.Lstat(rootViewPath)
@@ -391,7 +389,7 @@ func collectInterestingDir(rootDirPath, containerDirPath string, prefixes, files
 			}
 			if whiteout {
 				prefixes[containerDentryPath] = struct{}{}
-			} 
+			}
 			files[containerDentryPath] = struct{}{}
 		} else {
 			if err := collectInterestingDir(rootDentryPath, containerDentryPath, prefixes, files); err != nil {
