@@ -154,7 +154,26 @@ func getFileType(root *os.Root, path string) (FileType, error) {
 	return FileTypeOther, nil
 }
 
-func processNonDirMod(leftRoot, rightRoot *os.Root, rootViewPath, containerViewPath string, detected *[]DiffFileRecord) error {
+func isWithinAnyPrefix(path string, prefixes map[string]struct{}) bool {
+    for current := path; ; current = filepath.Dir(current) {
+        if _, exists := prefixes[current]; exists {
+            return true
+        }
+        parent := filepath.Dir(current)
+        if parent == current {
+            break
+        }
+    }
+    return false
+}
+
+func processNonDirMod(leftRoot, rightRoot *os.Root, rootViewPath, containerViewPath string, prefixes, files map[string]struct{}, detected *[]DiffFileRecord) error {
+	if _, exists := files[containerViewPath]; !exists {
+		return nil
+	}
+	if !isWithinAnyPrefix(containerViewPath, prefixes) {
+		return nil
+	}
 	leftInfo, err := leftRoot.Lstat(rootViewPath)
 	if err != nil {
 		return fmt.Errorf("lstat %s: %w", rootViewPath, err)
@@ -270,7 +289,7 @@ func recurseWithChangeType(root *os.Root, rootViewPath, containerViewPath string
 	return nil
 }
 
-func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, detected *[]DiffFileRecord) error {
+func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, prefixes, files map[string]struct{}, detected *[]DiffFileRecord) error {
 	// note: won't follow symlink dirs
 	// TODO make this faster
 	leftDir, err := leftRoot.Open(rootViewDir)
@@ -322,7 +341,7 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 		// Left and right entry
 		// both directories, so recurse
 		if leftDentry.IsDir() && rightDentry.IsDir() {
-			if err := walkFS(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, detected); err != nil {
+			if err := walkFS(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, prefixes, files, detected); err != nil {
 				return err
 			}
 			continue
@@ -338,7 +357,7 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 			continue
 		}
 		// Neither are directories -> check for modification
-		if err := processNonDirMod(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, detected); err != nil {
+		if err := processNonDirMod(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, prefixes, files, detected); err != nil {
 			return err
 		}
 	}
@@ -353,6 +372,61 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 			return err
 		}
 		continue
+	}
+	return nil
+}
+
+func collectInterestingDir(rootDirPath, containerDirPath string, prefixes, files map[string]struct{}) error {
+	dentries, err := os.ReadDir(rootDirPath)
+	if err != nil {
+		return fmt.Errorf("read directory %s: %w", rootDirPath, err)
+	}
+	for _, dentry := range dentries {
+		rootDentryPath := filepath.Join(rootDirPath, dentry.Name())
+		containerDentryPath := filepath.Join(containerDirPath, dentry.Name())
+		if !dentry.IsDir() {
+			whiteout, err := isWhiteout(rootDentryPath)
+			if err != nil {
+				return err
+			}
+			if whiteout {
+				prefixes[containerDentryPath] = struct{}{}
+			} 
+			files[containerDentryPath] = struct{}{}
+		} else {
+			if err := collectInterestingDir(rootDentryPath, containerDentryPath, prefixes, files); err != nil {
+				return err
+			}
+			opaque, err := isOpaque(rootDentryPath)
+			if err != nil {
+				return err
+			}
+			if opaque {
+				prefixes[containerDentryPath] = struct{}{}
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) getInteresting(d *DiffFS, prefixes, files map[string]struct{}) error {
+	leftLayers := d.leftLayerIDs
+	rightLayers := d.rightLayerIDs
+	lastCommonIdx := -1
+	for i := 0; i < len(leftLayers) && i < len(rightLayers); i++ {
+		if leftLayers[i] != rightLayers[i] {
+			break
+		}
+		lastCommonIdx = i
+	}
+	unsharedCkpts := leftLayers[lastCommonIdx+1:]
+	unsharedCkpts = append(unsharedCkpts, rightLayers[lastCommonIdx+1:]...)
+
+	for _, ckptID := range unsharedCkpts {
+		upperDirPath := m.checkpointUpperDir(ckptID)
+		if err := collectInterestingDir(upperDirPath, "/", prefixes, files); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -609,6 +683,13 @@ func (m *Manager) PrintDiff(ckptIDFirst, ckptIDSecond, targetDir string) error {
 	if err != nil {
 		return err
 	}
+
+	interestingFiles := make(map[string]struct{})
+	interestingPrefixes := make(map[string]struct{})
+	if err := m.getInteresting(d, interestingPrefixes, interestingFiles); err != nil {
+		return err
+	}
+
 	detected := make([]DiffFileRecord, 0)
 	switch {
 	case !leftExists && !rightExists:
@@ -621,7 +702,7 @@ func (m *Manager) PrintDiff(ckptIDFirst, ckptIDSecond, targetDir string) error {
 			return err
 		}
 	default:
-		if err := walkFS(leftRoot, rightRoot, targetForRoot, normalizedTargetDir, &detected); err != nil {
+		if err := walkFS(leftRoot, rightRoot, targetForRoot, normalizedTargetDir, interestingPrefixes, interestingFiles, &detected); err != nil {
 			return err
 		}
 	}
