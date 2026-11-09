@@ -71,6 +71,11 @@ type DiffFS struct {
 	rightMountPoint string
 }
 
+type interestingPaths struct {
+    prefixes map[string]struct{}
+    files    map[string]struct{}
+}
+
 func areRegFilesDiff(leftRoot, rightRoot *os.Root, path string) (bool, error) {
 	leftFile, err := leftRoot.Open(path)
 	if err != nil {
@@ -154,22 +159,8 @@ func getFileType(root *os.Root, path string) (FileType, error) {
 	return FileTypeOther, nil
 }
 
-func isWithinAnyPrefix(path string, prefixes map[string]struct{}) bool {
-	for current := path; ; current = filepath.Dir(current) {
-		if _, exists := prefixes[current]; exists {
-			return true
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			break
-		}
-	}
-	return false
-}
-
-func processNonDirMod(leftRoot, rightRoot *os.Root, rootViewPath, containerViewPath string, prefixes, files map[string]struct{}, detected *[]DiffFileRecord) error {
-	_, exists := files[containerViewPath]
-	if !exists && !isWithinAnyPrefix(containerViewPath, prefixes) {
+func processNonDirMod(leftRoot, rightRoot *os.Root, rootViewPath, containerViewPath string, prefixes, interesting *interestingPaths) error {
+	if !isInteresting(containerViewPath, interesting) {
 		return nil
 	}
 	leftInfo, err := leftRoot.Lstat(rootViewPath)
@@ -287,44 +278,36 @@ func recurseWithChangeType(root *os.Root, rootViewPath, containerViewPath string
 	return nil
 }
 
-func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, prefixes, files map[string]struct{}, detected *[]DiffFileRecord) error {
+func constructDentryMap(root *os.Root, rootViewDir string) (map[string]os.DirEntry, error) {
+	dir, err := root.Open(rootViewDir)
+	if err != nil {
+		return nil, fmt.Errorf("open directory %s: %w", rootViewDir, err)
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read directory %s: %w", rootViewDir, readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close directory %s: %w", rootViewDir, closeErr)
+	}
+	nameMap := make(map[string]os.DirEntry, len(entries))
+	for _, entry := range entries {
+		nameMap[entry.Name()] = entry
+	}
+	return nameMap, nil
+}
+
+func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, interesting *interestingPaths, detected *[]DiffFileRecord) error {
 	// note: won't follow symlink dirs
-	// TODO make this faster
-	leftDir, err := leftRoot.Open(rootViewDir)
+	leftNameMap, err := constructDentryMap(leftRoot, rootViewDir)
 	if err != nil {
-		return fmt.Errorf("open left directory %s: %w", rootViewDir, err)
+		return err
 	}
-	leftEntries, readErr := leftDir.ReadDir(-1)
-	closeErr := leftDir.Close()
-	if readErr != nil {
-		return fmt.Errorf("read left directory %s: %w", rootViewDir, readErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close left directory %s: %w", rootViewDir, closeErr)
-	}
-
-	rightDir, err := rightRoot.Open(rootViewDir)
+	rightNameMap, err := constructDentryMap(rightRoot, rootViewDir)
 	if err != nil {
-		return fmt.Errorf("open right directory %s: %w", rootViewDir, err)
+		return err
 	}
-	rightEntries, readErr := rightDir.ReadDir(-1)
-	closeErr = rightDir.Close()
-	if readErr != nil {
-		return fmt.Errorf("read right directory %s: %w", rootViewDir, readErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close right directory %s: %w", rootViewDir, closeErr)
-	}
-
-	leftNameMap := make(map[string]os.DirEntry, len(leftEntries))
-	for _, entry := range leftEntries {
-		leftNameMap[entry.Name()] = entry
-	}
-	rightNameMap := make(map[string]os.DirEntry, len(rightEntries))
-	for _, entry := range rightEntries {
-		rightNameMap[entry.Name()] = entry
-	}
-
 	for name, leftDentry := range leftNameMap {
 		containerViewSubpath := filepath.Join(containerViewDir, name)
 		rootViewSubpath := filepath.Join(rootViewDir, name)
@@ -336,10 +319,9 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 			}
 			continue
 		}
-		// Left and right entry
 		// both directories, so recurse
 		if leftDentry.IsDir() && rightDentry.IsDir() {
-			if err := walkFS(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, prefixes, files, detected); err != nil {
+			if err := walkFS(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, interesting, detected); err != nil {
 				return err
 			}
 			continue
@@ -354,8 +336,8 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 			}
 			continue
 		}
-		// Neither are directories -> check for modification
-		if err := processNonDirMod(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, prefixes, files, detected); err != nil {
+		// Neither directories -> check for modification
+		if err := processNonDirMod(leftRoot, rightRoot, rootViewSubpath, containerViewSubpath, interesting, detected); err != nil {
 			return err
 		}
 	}
@@ -374,7 +356,23 @@ func walkFS(leftRoot, rightRoot *os.Root, rootViewDir, containerViewDir string, 
 	return nil
 }
 
-func collectInterestingDir(rootDirPath, containerDirPath string, prefixes, files map[string]struct{}) error {
+func isInteresting(path string, interesting *interestingPaths) bool {
+	if _, exists := interesting.files[path]; exists {
+		return true
+	}
+	for current := path; ; current = filepath.Dir(current) {
+		if _, exists := interesting.prefixes[current]; exists {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return false
+}
+
+func collectInterestingDir(rootDirPath, containerDirPath string, interesting *interestingPaths) error {
 	dentries, err := os.ReadDir(rootDirPath)
 	if err != nil {
 		return fmt.Errorf("read directory %s: %w", rootDirPath, err)
@@ -388,26 +386,30 @@ func collectInterestingDir(rootDirPath, containerDirPath string, prefixes, files
 				return err
 			}
 			if whiteout {
-				prefixes[containerDentryPath] = struct{}{}
+				interesting.prefixes[containerDentryPath] = struct{}{}
 			}
-			files[containerDentryPath] = struct{}{}
+			interesting.files[containerDentryPath] = struct{}{}
 		} else {
-			if err := collectInterestingDir(rootDentryPath, containerDentryPath, prefixes, files); err != nil {
-				return err
-			}
 			opaque, err := isOpaque(rootDentryPath)
 			if err != nil {
 				return err
 			}
 			if opaque {
-				prefixes[containerDentryPath] = struct{}{}
+				interesting.prefixes[containerDentryPath] = struct{}{}
+				return nil
+			}
+			if err := collectInterestingDir(rootDentryPath, containerDentryPath, interesting); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-func (m *Manager) getInteresting(d *DiffFS, prefixes, files map[string]struct{}) error {
+func (m *Manager) getInteresting(d *DiffFS, interesting *interestingPaths) error {
+	// NOTE: assumes originalDir is the same for both checkpoints
+	// should first check if d.leftOriginalDir != d.rightOriginalDir, if so should need to collect interesting paths from original dir too (everything is interesting)
+	// maybe have path where if interesting is nil, check everything? so if original dirs differ, just check everything
 	leftLayers := d.leftLayerIDs
 	rightLayers := d.rightLayerIDs
 	lastCommonIdx := -1
@@ -422,7 +424,7 @@ func (m *Manager) getInteresting(d *DiffFS, prefixes, files map[string]struct{})
 
 	for _, ckptID := range unsharedCkpts {
 		upperDirPath := m.checkpointUpperDir(ckptID)
-		if err := collectInterestingDir(upperDirPath, "/", prefixes, files); err != nil {
+		if err := collectInterestingDir(upperDirPath, "/", interesting); err != nil {
 			return err
 		}
 	}
@@ -682,9 +684,11 @@ func (m *Manager) PrintDiff(ckptIDFirst, ckptIDSecond, targetDir string) error {
 		return err
 	}
 
-	interestingFiles := make(map[string]struct{})
-	interestingPrefixes := make(map[string]struct{})
-	if err := m.getInteresting(d, interestingPrefixes, interestingFiles); err != nil {
+	interesting := &interestingPaths{
+		prefixes: make(map[string]struct{}),
+		files:    make(map[string]struct{}),
+	}
+	if err := m.getInteresting(d, interesting); err != nil {
 		return err
 	}
 
@@ -700,7 +704,7 @@ func (m *Manager) PrintDiff(ckptIDFirst, ckptIDSecond, targetDir string) error {
 			return err
 		}
 	default:
-		if err := walkFS(leftRoot, rightRoot, targetForRoot, normalizedTargetDir, interestingPrefixes, interestingFiles, &detected); err != nil {
+		if err := walkFS(leftRoot, rightRoot, targetForRoot, normalizedTargetDir, interesting, &detected); err != nil {
 			return err
 		}
 	}
